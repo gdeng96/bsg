@@ -1,0 +1,307 @@
+---
+title: "Example_MTS_VAR1_MBSG"
+output: html_document
+---
+
+February 1, 2022
+
+This is an example notebook for generating MBSG influence and vulnerability scores to identify source anddd sink nodes with simulated VAR(1) multivariate time series under DCG network structure and independent Gaussian errors. Comparisons with Standard VAR is also included.
+
+##Load Packages
+```{r, warning=FALSE, message=FALSE}
+library(MTS)
+library(mvtnorm)
+library(knitr)
+library(data.table)
+library(cIRT)
+library(fBasics)
+library(MASS)
+library(igraph)
+```
+
+##Load MBSG Functions
+```{r}
+#Functions for Posterior Generation: works for any VAR(p)
+#Generate M posterior samples for 1 realization of time series
+design.matrix.from.ts <- function(zt, p) {
+nT <- nrow(zt)
+x = rep(1, nT-p)
+for (i in 1:p){
+  x = cbind(x, zt[(p+1-i):(nT-i), ])
+}
+return(as.matrix(x))
+}
+gen_posterior <- function(zt, p = 1, lambda=10, V0=NULL, n0=5, nsamples=1000, intercept=FALSE){
+  X = design.matrix.from.ts(zt, p)[, -1] #extracting design matrix from ts
+  k = ncol(zt) #dimension of ts
+  nT = nrow(zt) #total T obs
+  
+  #Setting up initial matrices
+  C = solve(lambda*diag(k*p)) #precision matrix of coefficient matrix
+  B0 = matrix(0, k*p, k)
+  if (intercept){
+    C = solve(lambda*diag(k*p+1)) #precision matrix of coefficient matrix
+    B0 = matrix(0, k*p+1, k) #hyperparameter, prior mean for parameters
+    X = design.matrix.from.ts(zt, p) #extracting design matrix from ts
+  }
+  if (is.null(V0)){
+    V0 = diag(k) # k-by-k covariance matrix for prior of Sigma_a
+  }
+  
+  ne = nT-p
+  Z = zt[(1+p):nT, ] #(T-p)-by-k matrix
+  Bhat = solve(t(X)%*%X) %*% t(X) %*%Z #LS estimate
+  Btilde = solve(t(X)%*%X + C) %*% (t(X) %*% X %*% Bhat + C %*% B0) #posterior mean 
+  Stilde = t(Z - X%*%Btilde) %*% (Z-X%*%Btilde) + t(Btilde- B0)%*% C %*% (Btilde - B0)
+  XXC = solve(t(X)%*%X + C)
+  V0S = V0 + Stilde
+  
+  pos_Beta = as.list(1:nsamples)
+  pos_BetaNoIntercept = as.list(1:nsamples)
+  pos_Sigma <- as.list(1:nsamples)
+  
+  num_columns = k*p
+  if (intercept){
+    num_columns = k*p+1
+  }
+  
+  set.seed(2020)
+  for (i in 1:nsamples){
+  Sigma_a <- riwishart(n0+ne, V0S) #This gives an kxk matrix
+  pos_Sigma[[i]] <- Sigma_a
+  beta_sample <- mvrnorm(1, vec(Btilde), Sigma_a %x% XXC) #row stack of kx(kp+1) matrix if intercept is TRUE
+  beta_matrix <- matrix(beta_sample, nrow=k, ncol=num_columns, byrow = TRUE) #convert back to matrix
+  
+  pos_Beta[[i]] <- beta_matrix
+  pos_BetaNoIntercept[[i]] <- beta_matrix
+  if (intercept){
+    pos_BetaNoIntercept[[i]] <- beta_matrix[, -1] #Remove the first column of intercepts
+  }
+  }
+  
+  #Getting point estimates from built-in BVAR
+  phi0=matrix(0, nrow=num_columns, ncol = num_columns) #BVAR does not run when intercept = FALSE and Phi0 is set to default NULL. Must add phi0 manually. Phi0 has an issue when include.mean=FALSE.
+  point_est = NA
+  if (intercept){
+    point_est =  BVAR(zt, p=p, C=lambda*diag(num_columns),V0=diag(k), 
+                   include.mean = intercept, Phi0 = NULL)
+  }else{
+    point_est = BVAR(zt, p=p, C=lambda*diag(num_columns),V0=diag(k), 
+                   include.mean = intercept, Phi0 = phi0)
+  }
+  point_estBeta = point_est$Phi
+  if(intercept){
+     point_estBeta = cbind(point_est$phi0, point_est$Phi)
+  }
+  point_estSigma = point_est$Sigma
+  return(list(pos_Beta = pos_Beta, pos_Sigma = pos_Sigma, 
+              pos_BetaNoIntercept = pos_BetaNoIntercept,
+              point_estBeta = point_estBeta, point_estSigma=point_estSigma, 
+              point_est = point_est))
+}
+gen_spillovers <- function(pos_Beta, pos_Sigma, lag, intercept=FALSE){
+  nsamples = length(pos_Beta)
+  k = nrow(pos_Sigma[[1]])
+  pos_spillover = as.list(1:nsamples)
+  pos_nspillover = as.list(1:nsamples)
+  pos_spilloverindex = rep(NA, times=nsamples)
+  
+  set.seed(2020)
+  for (i in 1:nsamples){
+    pos_Beta_sample = pos_Beta[[i]]
+    if (intercept){
+      pos_Beta_sample = pos_Beta_sample[, -1]
+    }
+    fevd_obj = FEVdec(pos_Beta_sample, Theta = NULL, pos_Sigma[[i]], lag=lag) 
+    start = lag*k + 1
+    end = (lag+1) * k
+    w =  fevd_obj$Omega[, start:end]
+    w_norm = fevd_obj$OmegaR[, start:end] * 100
+    pos_spillover[[i]] <- w
+    pos_nspillover[[i]] <- w_norm
+    pos_spilloverindex[i] <-  sum(w_norm) - tr(w_norm)
+    
+  }
+  return(list(pos_spillover = pos_spillover, pos_nspillover = pos_nspillover, pos_spilloverindex = pos_spilloverindex))
+}
+
+extract_pd <- function(input, i, j){
+  #input should be list of posterior sample matrices
+  pos_Beta <- input
+  posvalues <- rep(NA, length(pos_Beta))
+  for (d in 1:length(pos_Beta)){
+    posvalues[d] <- pos_Beta[[d]][i, j]
+  }
+  return(posvalues)
+}
+extract_scores <- function(nspillover){
+  nsamples = length(nspillover)
+  ncomponents = ncol(nspillover[[1]])
+  importance_score = as.list(1:nsamples)
+  vulnerability_score = as.list(1:nsamples)
+  for (i in 1:nsamples){
+    w = nspillover[[i]]
+    toSubtract = diag(nrow(w))
+    diag(toSubtract) <- diag(w)
+    s = w-toSubtract
+    importance = apply(s, 2, sum) #Column sums of all impact caused by node k
+    importance_score[[i]] = (importance/sum(s)) * 100
+    vulnerability_score[[i]] = apply(s, 1, sum) #Row sums of all impact going into node j
+  }
+  importance_score = do.call(rbind, importance_score)
+  vulnerability_score = do.call(rbind, vulnerability_score)
+  return(list(importance_score = importance_score, vulnerability_score = vulnerability_score))
+}
+
+#Load NDCG computations
+NDCG_calc = function(pred_ranking, ground_truth_order, ground_truth_rel, large2small = TRUE){
+  print(pred_ranking)
+  pred_order = order(pred_ranking, decreasing=large2small)
+  print(pred_order)
+  DCG = sum(ground_truth_rel/log2(pred_order + 1))
+  print(DCG)
+  IDCG = sum(ground_truth_rel/log2(ground_truth_order + 1))
+  print(IDCG)
+  NDCG = DCG/IDCG
+  return(NDCG)
+}
+```
+
+
+##Load Data
+```{r}
+MTSreps = list.files(".", pattern = "*MTSrep")
+
+MTS = read.csv(MTSreps[1])
+plot.ts(MTS[, 1:10])
+```
+
+## Run MBSG for 1:h
+```{r}
+#Specify ground truth
+d=20; nsink=5; nsource=5; nmedium=d-nsink-nsource; h = 10
+
+#Report accuracy (NDCG) for source/sink nodes based on MBSG influence and vulnerability. 
+imp_ndcg = as.list(1:5)
+vul_ndcg = as.list(1:5)
+
+for (j in 1:5){
+  zt = read.csv(MTSreps[j])
+  zt = as.matrix(zt)
+  bfitted = gen_posterior(zt, p=1, lambda=10, V0=cov(zt), n0=5, nsamples=100, intercept = FALSE)
+  
+  #importance scores
+  ground_truth_order = 1:dd
+  truth_rel_imp = c(rep(1, nsource), rep(0.5, nmedium), rep(0, nsink))
+
+  #vulnerability scores
+  ground_truth_order_vul = d:1
+  truth_rel_vul = c(rep(0, nsource), rep(0.5, nmedium), rep(1, nsink))
+  
+  ###Record bsg estimates for each h
+  imp_ndcg_h = rep(NA, times=h)
+  vul_ndcg_h = rep(NA, times=h)
+
+  ###Generate h forecasts
+  for (i in 1:h){
+    output_spillover <- gen_spillovers(bfitted$pos_Beta, bfitted$pos_Sigma, lag=i, intercept = FALSE)
+    output_scores <-  extract_scores(output_spillover$pos_nspillover)
+    importanceDF = data.frame(output_scores[[1]])
+    vulnerabilityDF = data.frame(output_scores[[2]])
+    bsg_imp_ranking = colMeans(importanceDF)
+    bsg_imp_ndcg = NDCG_calc(bsg_imp_ranking, ground_truth_order, truth_rel_imp)
+    
+    bsg_vul_ranking = colMeans(vulnerabilityDF) 
+    bsg_vul_ndcg = NDCG_calc(bsg_vul_ranking, ground_truth_order_vul, truth_rel_vul, large2small = TRUE)
+    
+    imp_ndcg_h[i] <- bsg_imp_ndcg
+    vul_ndcg_h[i] <- bsg_vul_ndcg
+    print(paste("Done with BSG iter:", h))
+  }
+  imp_ndcg[[j]] <- imp_ndcg_h
+  vul_ndcg[[j]] <- vul_ndcg_h
+}
+
+
+impDF = do.call(rbind, imp_ndcg)
+vulDF = do.call(rbind, vul_ndcg)
+DF = data.frame(rbind(impDF, vulDF))
+colnames(DF) = paste("MBSG:h=", 1:h, sep="")
+DF$Score = rep(c("Importance", "Vulnerability"), each=5)
+
+DF #NDCG for each of 5 replicates
+```
+
+## Run Standard VAR with FDR control
+```{r}
+#Set ground truth
+d=20; nsource=5; nsink=5; nmedium=d-nsource-nsink
+imp_ndcg = as.list(1:5)
+vul_ndcg = as.list(1:5)
+
+for (i in 1:5){
+  zt = read.csv(MTSreps[i])
+  #Baseline VAR Network Granger Causality w/ shrinkage from FDR
+  fitted_VAR = VAR(zt, p=1, include.mean = FALSE)
+
+  networkgc = fitted_VAR$Phi
+  gc_pvals = 1- pnorm(abs(fitted_VAR$Phi/fitted_VAR$Sigma)) #Two sided test
+  gc_pvals2 = c(gc_pvals) #This unlists by columns, e.g. c1, c2, c3
+  gc_pvals_adj = matrix(p.adjust(c(gc_pvals), method="fdr"), nrow=20, ncol=20, byrow = FALSE)
+  networkgc_adj = networkgc
+  networkgc_adj[gc_pvals_adj > 0.05] <- 0
+
+  est_graph <-  graph_from_adjacency_matrix(t(networkgc_adj), mode = "directed", weighted = TRUE, diag=FALSE)
+  plot(est_graph, main="Standard VAR")
+
+  #importance scores
+  ground_truth_order = 1:d
+  truth_rel_imp = c(rep(1, nsource), rep(0.5, nmedium), rep(0, nsink))
+  
+  outdeg_ranking = degree(est_graph, normalized=TRUE, mode = "out")
+  outdeg_imp_ndcg = NDCG_calc(outdeg_ranking, ground_truth_order, truth_rel_imp, large2small=TRUE)
+  
+  eigen_ranking = eigen_centrality(est_graph, scale=TRUE)$vector
+  eigen_imp_ndcg = NDCG_calc(eigen_ranking, ground_truth_order, truth_rel_imp, large2small=TRUE)
+  
+  between_ranking=betweenness(est_graph, weights=abs(E(est_graph)$weight))
+  between_imp_ndcg = NDCG_calc(between_ranking, ground_truth_order, truth_rel_imp, large2small=TRUE)
+  
+  closeness_ranking=closeness(est_graph, weights=abs(E(est_graph)$weight))
+  closeness_imp_ndcg = NDCG_calc(closeness_ranking, ground_truth_order, truth_rel_imp, large2small=TRUE)
+  
+  #vulnerability scores
+  ground_truth_order_vul = d:1
+  truth_rel_vul = c(rep(0, nsource), rep(0.5, nmedium), rep(1, nsink))
+  
+  eigen_ranking = eigen_centrality(est_graph, scale=TRUE)$vector
+  eigen_vul_ndcg = NDCG_calc(eigen_ranking, ground_truth_order_vul, truth_rel_vul, large2small = TRUE)
+  
+  between_ranking=betweenness(est_graph, weights=abs(E(est_graph)$weight))
+  between_vul_ndcg = NDCG_calc(between_ranking,  ground_truth_order_vul, truth_rel_vul, large2small = TRUE)
+  
+  closeness_ranking=closeness(est_graph, weights=abs(E(est_graph)$weight))
+  closeness_vul_ndcg = NDCG_calc(closeness_ranking,  ground_truth_order_vul, truth_rel_vul, large2small = TRUE)
+  
+  indeg_ranking = degree(est_graph, normalized=TRUE, mode="in") #high in degree is more vulnerable
+  indeg_vul_ndcg = NDCG_calc(indeg_ranking, ground_truth_order_vul, truth_rel_vul, large2small = TRUE)
+  
+  imp_ndcg[[i]] <- data.frame(Degree = outdeg_imp_ndcg, Eigen = eigen_imp_ndcg, 
+                        Between = between_imp_ndcg, Closeness = closeness_imp_ndcg)
+  
+  vul_ndcg[[i]] <- data.frame(Degree = indeg_vul_ndcg, Eigen = eigen_vul_ndcg, 
+                        Between = between_vul_ndcg, Closeness = closeness_vul_ndcg)
+
+  print(paste("Done with iteration", i))
+}
+
+impDF = do.call(rbind, imp_ndcg)
+vulDF = do.call(rbind, vul_ndcg)
+DF = data.frame(rbind(impDF, vulDF))
+DF$Score = rep(c("Importance", "Vulnerability"), each=5)
+
+DF #NDCG
+
+
+```
+
